@@ -1,16 +1,145 @@
 const express = require("express");
 const dotenv = require("dotenv");
+const crypto = require("crypto");
 
 dotenv.config();
 
 const app = express();
 
 // Permite recibir JSON en requests (body) con un límite de tamaño razonable
-app.use(express.json({ limit: "1mb" }));
+app.use(
+  express.json({
+    limit: "1mb",
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    }
+  })
+);
 
 // Endpoint simple para verificar que la API está viva
 app.get("/health", (req, res) => {
   res.json({ ok: true });
+});
+
+function verifyMetaSignature(req) {
+  const secret = process.env.META_APP_SECRET;
+  if (!secret) return true;
+
+  const header = req.headers["x-hub-signature-256"];
+  if (typeof header !== "string" || !header.startsWith("sha256=")) return false;
+
+  const raw = Buffer.isBuffer(req.rawBody)
+    ? req.rawBody
+    : Buffer.from(JSON.stringify(req.body || {}));
+
+  const digest = crypto.createHmac("sha256", secret).update(raw).digest("hex");
+  const expected = `sha256=${digest}`;
+
+  const a = Buffer.from(expected);
+  const b = Buffer.from(header);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+app.get("/webhook/meta", (req, res) => {
+  const mode = typeof req.query["hub.mode"] === "string" ? req.query["hub.mode"] : "";
+  const token =
+    typeof req.query["hub.verify_token"] === "string" ? req.query["hub.verify_token"] : "";
+  const challenge =
+    typeof req.query["hub.challenge"] === "string" ? req.query["hub.challenge"] : "";
+
+  const verifyToken = process.env.META_VERIFY_TOKEN;
+  if (mode === "subscribe" && verifyToken && token === verifyToken && challenge) {
+    return res.status(200).send(challenge);
+  }
+
+  return res.sendStatus(403);
+});
+
+app.post("/webhook/meta", async (req, res) => {
+  if (!verifyMetaSignature(req)) return res.sendStatus(401);
+
+  const metaToken = process.env.META_ACCESS_TOKEN;
+  const brevoKey = process.env.BREVO_API_KEY;
+
+  if (!metaToken) {
+    return res.status(500).json({ ok: false, error: "Falta META_ACCESS_TOKEN en el entorno." });
+  }
+  if (!brevoKey) {
+    return res.status(500).json({ ok: false, error: "Falta BREVO_API_KEY en el entorno." });
+  }
+
+  const listIdRaw = process.env.BREVO_LIST_ID;
+  const listIdNumber = listIdRaw ? Number.parseInt(String(listIdRaw), 10) : null;
+  const validListId = Number.isInteger(listIdNumber) && listIdNumber > 0;
+
+  const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
+  const tasks = [];
+
+  for (const entry of entries) {
+    const changes = Array.isArray(entry?.changes) ? entry.changes : [];
+    for (const change of changes) {
+      if (change?.field !== "leadgen") continue;
+      const value = change?.value || {};
+      const leadgenId = value?.leadgen_id ? String(value.leadgen_id) : "";
+      const formId = value?.form_id ? String(value.form_id) : "";
+      if (!leadgenId) continue;
+
+      tasks.push(
+        (async () => {
+          let accessToken = metaToken;
+          if (formId) {
+            const resolved = await resolveFormPageAccessToken(formId, metaToken);
+            if (resolved.ok && resolved.page?.access_token) accessToken = resolved.page.access_token;
+          }
+
+          const leadUrl = new URL(`https://graph.facebook.com/v19.0/${leadgenId}`);
+          leadUrl.searchParams.set("access_token", accessToken);
+          leadUrl.searchParams.set("fields", "id,created_time,ad_id,form_id,field_data");
+
+          let leadResult = await fetchGraphJson(leadUrl);
+          if (!leadResult.ok && accessToken !== metaToken) {
+            leadUrl.searchParams.set("access_token", metaToken);
+            leadResult = await fetchGraphJson(leadUrl);
+          }
+          if (!leadResult.ok) return;
+
+          const lead = leadResult.data;
+          const data = normalizeLeadFields(lead?.field_data);
+          const email = String(data?.correo || "").trim();
+          if (!email) return;
+
+          const attributes = {};
+          if (data?.Nombre) attributes.FIRSTNAME = String(data.Nombre);
+          if (data?.Apellido) attributes.LASTNAME = String(data.Apellido);
+          if (data?.telefono) attributes.PHONE = String(data.telefono);
+          if (data?.web) attributes.WEB = String(data.web);
+          if (data?.selecciona_un_servicio) attributes.SERVICIO = String(data.selecciona_un_servicio);
+          if (data?.["¿cúentanos_en_qué_necesitas_ayuda?"])
+            attributes.MENSAJE = String(data["¿cúentanos_en_qué_necesitas_ayuda?"]);
+
+          await brevoUpsertContact({
+            apiKey: brevoKey,
+            email,
+            attributes,
+            listId: validListId ? listIdNumber : null
+          });
+        })()
+      );
+    }
+  }
+
+  try {
+    await Promise.all(tasks);
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: "Error procesando webhook",
+      details: err?.message || String(err)
+    });
+  }
+
+  return res.json({ ok: true });
 });
 
 // Obtiene el access token de Meta desde:
