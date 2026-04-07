@@ -21,6 +21,29 @@ app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
+function safeEqual(a, b) {
+  const aa = Buffer.from(String(a || ""));
+  const bb = Buffer.from(String(b || ""));
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
+}
+
+function getCronToken(req) {
+  const fromHeader = req.headers["x-cron-token"];
+  if (typeof fromHeader === "string" && fromHeader.trim()) return fromHeader.trim();
+  if (typeof req.query.cron_token === "string" && req.query.cron_token.trim())
+    return req.query.cron_token.trim();
+  return null;
+}
+
+function requireCronAuthIfConfigured(req, res) {
+  const expected = process.env.CRON_TOKEN;
+  if (!expected) return true;
+  const provided = getCronToken(req);
+  if (!provided) return false;
+  return safeEqual(provided, expected);
+}
+
 function verifyMetaSignature(req) {
   const secret = process.env.META_APP_SECRET;
   if (!secret) return true;
@@ -331,6 +354,9 @@ app.post("/brevo/lists/:list_id/contacts/attributes", async (req, res) => {
 });
 
 app.post("/brevo/lists/:list_id/repair", async (req, res) => {
+  if (!requireCronAuthIfConfigured(req, res)) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
   const brevoKey = getBrevoApiKey(req);
   if (!brevoKey) {
     return res.status(400).json({
@@ -1473,6 +1499,9 @@ app.get("/meta/forms/:form_id/leads/normalized", async (req, res) => {
 });
 
 app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
+  if (!requireCronAuthIfConfigured(req, res)) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
   const metaToken = getMetaAccessToken(req);
   if (!metaToken) {
     return res.status(400).json({
