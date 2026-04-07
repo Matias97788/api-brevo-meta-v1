@@ -110,11 +110,13 @@ app.post("/webhook/meta", async (req, res) => {
           if (!email) return;
 
           const attributes = {};
-          if (data?.Nombre) attributes.FIRSTNAME = String(data.Nombre);
-          if (data?.Apellido) attributes.LASTNAME = String(data.Apellido);
-          if (data?.telefono) attributes.PHONE = String(data.telefono);
-          if (data?.web) attributes.WEB = String(data.web);
-          if (data?.selecciona_un_servicio) attributes.SERVICIO = String(data.selecciona_un_servicio);
+          if (data?.Nombre) attributes.NOMBRE = String(data.Nombre);
+          if (data?.Apellido) attributes.APELLIDOS = String(data.Apellido);
+          const phone = normalizePhone(data?.telefono);
+          if (phone) attributes.TELEFONO = phone;
+          if (phone) attributes.SMS = phone;
+          if (data?.web) attributes.URL_SITIO = String(data.web);
+          if (data?.selecciona_un_servicio) attributes.SERVICIOS = String(data.selecciona_un_servicio);
           if (data?.["¿cúentanos_en_qué_necesitas_ayuda?"])
             attributes.MENSAJE = String(data["¿cúentanos_en_qué_necesitas_ayuda?"]);
 
@@ -142,6 +144,327 @@ app.post("/webhook/meta", async (req, res) => {
   return res.json({ ok: true });
 });
 
+app.get("/brevo/contacts/:email", async (req, res) => {
+  const brevoKey = getBrevoApiKey(req);
+  if (!brevoKey) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Falta el token de Brevo. Configura BREVO_API_KEY en el entorno o envía Authorization: Brevo <api_key>."
+    });
+  }
+  const email = String(req.params.email || "").trim();
+  if (!email) return res.status(400).json({ ok: false, error: "Falta email." });
+  const r = await brevoGetContact({ apiKey: brevoKey, email });
+  return res.status(r.ok ? 200 : r.status).json({ ok: r.ok, data: r.data });
+});
+
+app.get("/brevo/attributes", async (req, res) => {
+  const brevoKey = getBrevoApiKey(req);
+  if (!brevoKey) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Falta el token de Brevo. Configura BREVO_API_KEY en el entorno o envía Authorization: Brevo <api_key>."
+    });
+  }
+  const r = await brevoGetContactAttributes({ apiKey: brevoKey });
+  return res.status(r.ok ? 200 : r.status).json({ ok: r.ok, data: r.data });
+});
+
+app.get("/brevo/lists/:list_id/contacts", async (req, res) => {
+  const brevoKey = getBrevoApiKey(req);
+  if (!brevoKey) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Falta el token de Brevo. Configura BREVO_API_KEY en el entorno o envía Authorization: Brevo <api_key>."
+    });
+  }
+  const listId = String(req.params.list_id || "").trim();
+  if (!listId) return res.status(400).json({ ok: false, error: "Falta list_id." });
+
+  const limitRaw = typeof req.query.limit === "string" ? req.query.limit.trim() : "";
+  const offsetRaw = typeof req.query.offset === "string" ? req.query.offset.trim() : "";
+  const limit = limitRaw ? Number.parseInt(limitRaw, 10) : null;
+  const offset = offsetRaw ? Number.parseInt(offsetRaw, 10) : null;
+
+  const allRaw = typeof req.query.all === "string" ? req.query.all.trim().toLowerCase() : "";
+  const all = ["1", "true", "yes"].includes(allRaw);
+
+  if (all) {
+    const r = await brevoGetAllContactsInList({
+      apiKey: brevoKey,
+      listId,
+      pageLimit: Number.isFinite(limit) && limit > 0 ? limit : 500
+    });
+    return res.status(r.ok ? 200 : r.status).json({ ok: r.ok, data: r.data });
+  }
+
+  const r = await brevoGetContactsInList({
+    apiKey: brevoKey,
+    listId,
+    limit: Number.isFinite(limit) && limit > 0 ? limit : null,
+    offset: Number.isFinite(offset) && offset >= 0 ? offset : null
+  });
+  return res.status(r.ok ? 200 : r.status).json({ ok: r.ok, data: r.data });
+});
+
+app.post("/brevo/contacts/attributes", async (req, res) => {
+  const brevoKey = getBrevoApiKey(req);
+  if (!brevoKey) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Falta el token de Brevo. Configura BREVO_API_KEY en el entorno o envía Authorization: Brevo <api_key>."
+    });
+  }
+
+  const emails = extractEmailsFromBody(req.body);
+  if (emails.length === 0) {
+    return res.status(400).json({
+      ok: false,
+      error: "No se encontraron emails en el JSON. Envia { emails: [...] } o { contacts: [...] }."
+    });
+  }
+
+  const maxRaw = typeof req.query.max === "string" ? req.query.max.trim() : "";
+  const max = maxRaw ? Number.parseInt(maxRaw, 10) : null;
+  const cap = Number.isFinite(max) && max > 0 ? Math.min(max, 200) : 50;
+  const selected = emails.slice(0, cap);
+
+  const perContact = [];
+  const attributeKeys = new Set();
+
+  for (const email of selected) {
+    const r = await brevoGetContact({ apiKey: brevoKey, email });
+    if (r.ok && r.data && typeof r.data === "object") {
+      const attrs = r.data.attributes && typeof r.data.attributes === "object" ? r.data.attributes : {};
+      for (const k of Object.keys(attrs)) attributeKeys.add(k);
+      perContact.push({ email, ok: true, attributes: attrs });
+    } else {
+      perContact.push({ email, ok: false, status: r.status, error: r.data });
+    }
+  }
+
+  return res.json({
+    ok: true,
+    total_requested: emails.length,
+    total_processed: selected.length,
+    attribute_keys: Array.from(attributeKeys).sort(),
+    contacts: perContact
+  });
+});
+
+app.post("/brevo/lists/:list_id/contacts/attributes", async (req, res) => {
+  const brevoKey = getBrevoApiKey(req);
+  if (!brevoKey) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Falta el token de Brevo. Configura BREVO_API_KEY en el entorno o envía Authorization: Brevo <api_key>."
+    });
+  }
+  const listId = String(req.params.list_id || "").trim();
+  if (!listId) return res.status(400).json({ ok: false, error: "Falta list_id." });
+
+  const limitRaw = typeof req.query.limit === "string" ? req.query.limit.trim() : "";
+  const offsetRaw = typeof req.query.offset === "string" ? req.query.offset.trim() : "";
+  const limit = limitRaw ? Number.parseInt(limitRaw, 10) : null;
+  const offset = offsetRaw ? Number.parseInt(offsetRaw, 10) : null;
+
+  let emails = extractEmailsFromBody(req.body);
+  if (emails.length === 0) {
+    const listRes = await brevoGetContactsInList({
+      apiKey: brevoKey,
+      listId,
+      limit: Number.isFinite(limit) && limit > 0 ? limit : 50,
+      offset: Number.isFinite(offset) && offset >= 0 ? offset : 0
+    });
+    if (!listRes.ok) {
+      return res
+        .status(listRes.status)
+        .json({ ok: false, error: "No se pudo obtener contactos de la lista", details: listRes.data });
+    }
+
+    const contacts = Array.isArray(listRes.data?.contacts) ? listRes.data.contacts : [];
+    emails = contacts
+      .map((c) => (c?.email ? String(c.email).trim() : ""))
+      .filter(Boolean);
+  }
+
+  if (emails.length === 0) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "No se encontraron emails ni en el JSON ni en la lista. Envia { emails: [...] } o revisa list_id."
+    });
+  }
+
+  const maxRaw = typeof req.query.max === "string" ? req.query.max.trim() : "";
+  const max = maxRaw ? Number.parseInt(maxRaw, 10) : null;
+  const cap = Number.isFinite(max) && max > 0 ? Math.min(max, 200) : Math.min(emails.length, 50);
+  const selected = emails.slice(0, cap);
+
+  const perContact = [];
+  const attributeKeys = new Set();
+
+  for (const email of selected) {
+    const r = await brevoGetContact({ apiKey: brevoKey, email });
+    if (r.ok && r.data && typeof r.data === "object") {
+      const attrs = r.data.attributes && typeof r.data.attributes === "object" ? r.data.attributes : {};
+      for (const k of Object.keys(attrs)) attributeKeys.add(k);
+      perContact.push({ email, ok: true, attributes: attrs });
+    } else {
+      perContact.push({ email, ok: false, status: r.status, error: r.data });
+    }
+  }
+
+  return res.json({
+    ok: true,
+    list_id: listId,
+    total_requested: emails.length,
+    total_processed: selected.length,
+    attribute_keys: Array.from(attributeKeys).sort(),
+    contacts: perContact
+  });
+});
+
+app.post("/brevo/lists/:list_id/repair", async (req, res) => {
+  const brevoKey = getBrevoApiKey(req);
+  if (!brevoKey) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Falta el token de Brevo. Configura BREVO_API_KEY en el entorno o envía Authorization: Brevo <api_key>."
+    });
+  }
+
+  const listId = String(req.params.list_id || "").trim();
+  if (!listId) return res.status(400).json({ ok: false, error: "Falta list_id." });
+
+  const dryRun =
+    typeof req.query.dry_run === "string" &&
+    ["1", "true", "yes"].includes(req.query.dry_run.trim().toLowerCase());
+
+  const emailsFromBody = extractEmailsFromBody(req.body);
+  const useProvidedEmails = emailsFromBody.length > 0;
+
+  let emails = emailsFromBody;
+  if (!useProvidedEmails) {
+    const listRes = await brevoGetAllContactsInList({ apiKey: brevoKey, listId, pageLimit: 500 });
+    if (!listRes.ok) {
+      return res
+        .status(listRes.status)
+        .json({ ok: false, error: "No se pudo obtener contactos de la lista", details: listRes.data });
+    }
+    const contacts = Array.isArray(listRes.data?.contacts) ? listRes.data.contacts : [];
+    emails = contacts
+      .map((c) => (c?.email ? String(c.email).trim() : ""))
+      .filter(Boolean);
+  }
+
+  const results = [];
+  for (const email of emails) {
+    const contactRes = await brevoGetContact({ apiKey: brevoKey, email });
+    if (!contactRes.ok || !contactRes.data || typeof contactRes.data !== "object") {
+      results.push({
+        email,
+        ok: false,
+        status: contactRes.status,
+        error: contactRes.data
+      });
+      continue;
+    }
+
+    const attrs =
+      contactRes.data.attributes && typeof contactRes.data.attributes === "object"
+        ? contactRes.data.attributes
+        : {};
+
+    const repair = repairBrevoAttributes({ email, attributes: attrs });
+    if (!repair.changed) {
+      results.push({ email, ok: true, changed: false, patch: {} });
+      continue;
+    }
+
+    if (dryRun) {
+      results.push({ email, ok: true, changed: true, patch: repair.patch });
+      continue;
+    }
+
+    const updateRes = await brevoUpsertContact({
+      apiKey: brevoKey,
+      email,
+      attributes: repair.patch,
+      listId: null
+    });
+
+    results.push({
+      email,
+      ok: updateRes.ok,
+      changed: true,
+      patch: repair.patch,
+      status: updateRes.status,
+      details: updateRes.data
+    });
+  }
+
+  const changed = results.filter((r) => r.ok && r.changed).length;
+  const failed = results.filter((r) => !r.ok).length;
+
+  return res.json({
+    ok: true,
+    list_id: listId,
+    dry_run: dryRun,
+    total: results.length,
+    changed,
+    failed,
+    results
+  });
+});
+
+app.post("/brevo/contacts/upsert", async (req, res) => {
+  const brevoKey = getBrevoApiKey(req);
+  if (!brevoKey) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Falta el token de Brevo. Configura BREVO_API_KEY en el entorno o envía Authorization: Brevo <api_key>."
+    });
+  }
+  const email = String(req.body?.email || "").trim();
+  if (!email) return res.status(400).json({ ok: false, error: "Falta email." });
+  const listIdRaw =
+    typeof req.body?.list_id === "string" && req.body.list_id.trim()
+      ? req.body.list_id.trim()
+      : process.env.BREVO_LIST_ID;
+  const listIdNumber = listIdRaw ? Number.parseInt(String(listIdRaw), 10) : null;
+  const validListId = Number.isInteger(listIdNumber) && listIdNumber > 0;
+  const attrs = req.body?.attributes && typeof req.body.attributes === "object" ? req.body.attributes : {};
+  const attributes = { ...attrs };
+  if (attributes.phone && !attributes.SMS) {
+    attributes.SMS = String(attributes.phone);
+    delete attributes.phone;
+  }
+  if (attributes.TELEFONO) {
+    const p = normalizePhone(attributes.TELEFONO);
+    if (p) attributes.TELEFONO = p;
+    else delete attributes.TELEFONO;
+  }
+  if (attributes.SMS) {
+    const p = normalizePhone(attributes.SMS);
+    if (p) attributes.SMS = p;
+    else delete attributes.SMS;
+  }
+  const r = await brevoUpsertContact({
+    apiKey: brevoKey,
+    email,
+    attributes,
+    listId: validListId ? listIdNumber : null
+  });
+  return res.status(r.ok ? 200 : r.status).json({ ok: r.ok, data: r.data });
+});
 // Obtiene el access token de Meta desde:
 // 1) Header: Authorization: Bearer <token>
 // 2) Variable de entorno: META_ACCESS_TOKEN
@@ -239,22 +562,19 @@ function cleanMetaFieldName(value) {
 
 function normalizeLeadFieldKey(rawKey) {
   const key = cleanMetaFieldName(rawKey);
-
-  const exactMap = {
-    Oscar: "Nombre",
-    Pinto: "Apellido",
-    "+569": "telefono",
-    "www.": "web",
-    "xxxxxx@nomanadas.com": "correo"
-  };
-
-  if (exactMap[key]) return exactMap[key];
-
-  const lower = key.toLowerCase();
+  const lower = key.toLowerCase().replace(/\s+/g, "_");
+  if (["email", "e_mail", "correo", "mail"].includes(lower)) return "correo";
+  if (
+    ["phone_number", "phone", "telefono", "mobile_phone", "contact_phone_number"].includes(lower)
+  )
+    return "telefono";
+  if (["website", "web", "url"].includes(lower)) return "web";
+  if (["first_name", "nombre", "name_first"].includes(lower)) return "Nombre";
+  if (["last_name", "apellido", "surname", "name_last"].includes(lower)) return "Apellido";
+  if (["full_name", "name", "nombre_completo"].includes(lower)) return "NombreCompleto";
   if (lower.includes("@")) return "correo";
   if (lower.startsWith("www") || lower.startsWith("http")) return "web";
   if (/^\+?\d[\d\s()-]*$/.test(key)) return "telefono";
-
   return key;
 }
 
@@ -267,6 +587,104 @@ function normalizeLeadFields(fieldData) {
     if (!key) continue;
     if (values.length === 0) continue;
     output[key] = values.length === 1 ? values[0] : values;
+  }
+
+  if (
+    typeof output.Nombre !== "string" &&
+    typeof output.Apellido !== "string" &&
+    typeof output.NombreCompleto !== "string"
+  ) {
+    const reserved = new Set([
+      "Nombre",
+      "Apellido",
+      "NombreCompleto",
+      "correo",
+      "telefono",
+      "web",
+      "selecciona_un_servicio",
+      "¿cúentanos_en_qué_necesitas_ayuda?"
+    ]);
+    const candidates = Object.entries(output)
+      .filter(([k, v]) => !reserved.has(k) && typeof v === "string" && v.trim())
+      .map(([k, v]) => ({ key: k, value: v.trim() }));
+
+    const looksLikeFullName = (s) => {
+      const parts = s.split(/\s+/).filter(Boolean);
+      if (parts.length < 2) return false;
+      if (s.length < 4) return false;
+      if (/@/.test(s)) return false;
+      if (/^\+?\d[\d\s()-]*$/.test(s)) return false;
+      return /[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]/.test(s);
+    };
+
+    const fullName = candidates.find((c) => looksLikeFullName(c.value));
+    if (fullName) {
+      output.NombreCompleto = fullName.value;
+      delete output[fullName.key];
+    } else {
+      const looksLikeSingleNameWord = (s) => {
+        if (s.length < 2) return false;
+        if (/@/.test(s)) return false;
+        if (s.startsWith("http") || s.startsWith("www.")) return false;
+        if (/^\+?\d[\d\s()-]*$/.test(s)) return false;
+        const parts = s.split(/\s+/).filter(Boolean);
+        if (parts.length !== 1) return false;
+        return /^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ'’-]+$/.test(parts[0]);
+      };
+
+      const nameWords = candidates.filter((c) => looksLikeSingleNameWord(c.value));
+      if (nameWords.length >= 2) {
+        output.Nombre = nameWords[0].value;
+        output.Apellido = nameWords[1].value;
+        delete output[nameWords[0].key];
+        delete output[nameWords[1].key];
+      } else if (nameWords.length === 1) {
+        output.Nombre = nameWords[0].value;
+        delete output[nameWords[0].key];
+      }
+    }
+  }
+
+  if (typeof output.NombreCompleto === "string") {
+    const parts = output.NombreCompleto.trim().split(/\s+/);
+    const first = parts[0] || "";
+    const last = parts.slice(1).join(" ") || "";
+    if (first && !Object.prototype.hasOwnProperty.call(output, "Nombre")) {
+      output.Nombre = first;
+    }
+    if (last && !Object.prototype.hasOwnProperty.call(output, "Apellido")) {
+      output.Apellido = last;
+    }
+    delete output.NombreCompleto;
+  }
+
+  if (typeof output.Apellido === "string") {
+    const reserved = new Set([
+      "Nombre",
+      "Apellido",
+      "correo",
+      "telefono",
+      "web",
+      "selecciona_un_servicio",
+      "¿cúentanos_en_qué_necesitas_ayuda?"
+    ]);
+    const extraSurname = Object.entries(output)
+      .filter(([k, v]) => !reserved.has(k) && typeof v === "string" && v.trim())
+      .map(([k, v]) => ({ key: k, value: v.trim() }))
+      .find((c) => {
+        if (c.value.split(/\s+/).filter(Boolean).length !== 1) return false;
+        if (/@/.test(c.value)) return false;
+        if (/^\+?\d[\d\s()-]*$/.test(c.value)) return false;
+        return /[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]/.test(c.value);
+      });
+
+    if (extraSurname) {
+      const current = output.Apellido.trim();
+      if (current && !current.includes(extraSurname.value)) {
+        output.Apellido = `${current} ${extraSurname.value}`.trim();
+      }
+      delete output[extraSurname.key];
+    }
   }
 
   const orderedKeys = [
@@ -288,6 +706,153 @@ function normalizeLeadFields(fieldData) {
   }
 
   return ordered;
+}
+
+function normalizePhone(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+
+  let s = raw.replace(/[^\d+]/g, "");
+  if (s.startsWith("00")) s = `+${s.slice(2)}`;
+
+  if (s.startsWith("+")) {
+    const digits = s.slice(1).replace(/\D/g, "");
+    if (!digits) return null;
+    let normalizedDigits = digits;
+    if (digits.length > 11 && digits.includes("569")) {
+      const idx = digits.lastIndexOf("569");
+      if (idx >= 0 && idx + 11 <= digits.length) normalizedDigits = digits.slice(idx, idx + 11);
+    }
+
+    const out = `+${normalizedDigits}`;
+    if (out.startsWith("+56")) {
+      if (out.length !== 12) return null;
+      if (!out.startsWith("+569")) return null;
+    } else if (out.length < 11) {
+      return null;
+    }
+    return out;
+  }
+
+  s = s.replace(/\D/g, "");
+  if (!s) return null;
+
+  if (s.startsWith("569") && s.length === 11) return `+${s}`;
+  if (s.startsWith("56") && s.length === 11) return `+${s}`;
+  if (s.length === 9 && s.startsWith("9")) return `+56${s}`;
+
+  return null;
+}
+
+function repairBrevoAttributes({ email, attributes }) {
+  const patch = {};
+  const lowerEmail = String(email || "").trim().toLowerCase();
+
+  const get = (k) => {
+    const v = attributes && Object.prototype.hasOwnProperty.call(attributes, k) ? attributes[k] : null;
+    if (v === null || v === undefined) return null;
+    const s = String(v).trim();
+    return s ? s : null;
+  };
+
+  const isEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v || "").trim());
+  const isUrlLike = (v) => {
+    const s = String(v || "").trim();
+    if (!s) return false;
+    if (isEmail(s)) return false;
+    if (normalizePhone(s)) return false;
+    if (/\s/.test(s)) return false;
+    if (s.startsWith("http://") || s.startsWith("https://") || s.startsWith("www.")) return true;
+    if (/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(\/.*)?$/.test(s)) return true;
+    return false;
+  };
+
+  const knownServices = new Set([
+    "paid_media",
+    "desarrollo",
+    "consultoría_de_marketing",
+    "social_media",
+    "email_marketing",
+    "data_y_análisis",
+    "consultoria_de_marketing",
+    "data_y_analisis"
+  ]);
+
+  const isServiceLike = (v) => {
+    const s = String(v || "").trim();
+    if (!s) return false;
+    if (isEmail(s)) return false;
+    if (isUrlLike(s)) return false;
+    if (normalizePhone(s)) return false;
+    const lower = s.toLowerCase();
+    if (knownServices.has(lower)) return true;
+    if (/^[a-záéíóúüñ_]+$/i.test(s) && s.includes("_") && s.length <= 40) return true;
+    return false;
+  };
+
+  const maybeMovePhone = (value, sourceKey) => {
+    const p = normalizePhone(value);
+    if (!p) return false;
+    const current = get("TELEFONO");
+    if (!current || normalizePhone(current) !== p) patch.TELEFONO = p;
+    const sms = get("SMS");
+    if (!sms || normalizePhone(sms) !== p) patch.SMS = p;
+    patch[sourceKey] = "";
+    return true;
+  };
+
+  const url = get("URL_SITIO");
+  if (url && isEmail(url) && lowerEmail && url.toLowerCase() === lowerEmail) patch.URL_SITIO = "";
+  if (url && normalizePhone(url)) {
+    maybeMovePhone(url, "URL_SITIO");
+  }
+
+  const telefono = get("TELEFONO");
+  if (telefono) {
+    const p = normalizePhone(telefono);
+    if (p) {
+      if (telefono !== p) patch.TELEFONO = p;
+    } else {
+      patch.TELEFONO = null;
+    }
+  }
+
+  const sms = get("SMS");
+  if (sms) {
+    const p = normalizePhone(sms);
+    if (p) {
+      if (sms !== p) patch.SMS = p;
+    } else {
+      patch.SMS = null;
+    }
+  }
+
+  const servicios = get("SERVICIOS");
+  if (servicios) {
+    if (normalizePhone(servicios)) {
+      maybeMovePhone(servicios, "SERVICIOS");
+    } else if (isUrlLike(servicios)) {
+      const currentUrl = get("URL_SITIO");
+      if (!currentUrl || isEmail(currentUrl)) patch.URL_SITIO = servicios;
+      patch.SERVICIOS = "";
+    }
+  }
+
+  const nombre = get("NOMBRE");
+  if (nombre) {
+    if (isUrlLike(nombre)) {
+      const currentUrl = get("URL_SITIO");
+      if (!currentUrl || isEmail(currentUrl)) patch.URL_SITIO = nombre;
+      patch.NOMBRE = "";
+    } else if (isServiceLike(nombre)) {
+      const currentService = get("SERVICIOS");
+      if (!currentService || isUrlLike(currentService) || normalizePhone(currentService)) patch.SERVICIOS = nombre;
+      patch.NOMBRE = "";
+    }
+  }
+
+  const changed = Object.keys(patch).length > 0;
+  return { changed, patch };
 }
 
 function getBrevoApiKey(req) {
@@ -339,6 +904,89 @@ async function brevoAddContactsToList({ apiKey, listId, emails }) {
 
   const data = await res.json().catch(() => null);
   return { ok: res.ok, status: res.status, data };
+}
+
+async function brevoGetContact({ apiKey, email }) {
+  const url = `https://api.brevo.com/v3/contacts/${encodeURIComponent(email)}`;
+  const res = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+      "api-key": apiKey
+    }
+  });
+  const data = await res.json().catch(() => null);
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function brevoGetContactAttributes({ apiKey }) {
+  const url = "https://api.brevo.com/v3/contacts/attributes";
+  const res = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+      "api-key": apiKey
+    }
+  });
+  const data = await res.json().catch(() => null);
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function brevoGetContactsInList({ apiKey, listId, limit, offset }) {
+  const url = new URL(`https://api.brevo.com/v3/contacts/lists/${encodeURIComponent(listId)}/contacts`);
+  if (Number.isFinite(limit) && limit > 0) url.searchParams.set("limit", String(limit));
+  if (Number.isFinite(offset) && offset >= 0) url.searchParams.set("offset", String(offset));
+
+  const res = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+      "api-key": apiKey
+    }
+  });
+  const data = await res.json().catch(() => null);
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function brevoGetAllContactsInList({ apiKey, listId, pageLimit }) {
+  const limit = Number.isFinite(pageLimit) && pageLimit > 0 ? pageLimit : 500;
+  let offset = 0;
+  let expectedCount = null;
+  const contacts = [];
+
+  while (true) {
+    const r = await brevoGetContactsInList({ apiKey, listId, limit, offset });
+    if (!r.ok) return r;
+
+    const pageContacts = Array.isArray(r.data?.contacts) ? r.data.contacts : [];
+    if (typeof r.data?.count === "number") expectedCount = r.data.count;
+
+    contacts.push(...pageContacts);
+
+    if (expectedCount !== null && contacts.length >= expectedCount) break;
+    if (pageContacts.length === 0) break;
+
+    offset += pageContacts.length;
+  }
+
+  return { ok: true, status: 200, data: { count: expectedCount ?? contacts.length, contacts } };
+}
+
+function extractEmailsFromBody(body) {
+  const takeEmail = (value) => {
+    if (!value) return "";
+    if (typeof value === "string") return value.trim();
+    if (typeof value === "object") {
+      const candidates = [value.email, value.Email, value.mail, value.correo];
+      for (const c of candidates) {
+        if (typeof c === "string" && c.trim()) return c.trim();
+      }
+    }
+    return "";
+  };
+
+  const items =
+    Array.isArray(body) ? body : Array.isArray(body?.emails) ? body.emails : Array.isArray(body?.contacts) ? body.contacts : [];
+
+  const emails = items.map(takeEmail).filter(Boolean);
+  return Array.from(new Set(emails));
 }
 
 async function resolveFormPageAccessToken(formId, userToken) {
@@ -925,12 +1573,14 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
         if (!email) return null;
 
         const attributes = {};
-        if (lead?.data?.Nombre) attributes.FIRSTNAME = String(lead.data.Nombre);
-        if (lead?.data?.Apellido) attributes.LASTNAME = String(lead.data.Apellido);
-        if (lead?.data?.telefono) attributes.PHONE = String(lead.data.telefono);
-        if (lead?.data?.web) attributes.WEB = String(lead.data.web);
+        if (lead?.data?.Nombre) attributes.NOMBRE = String(lead.data.Nombre);
+        if (lead?.data?.Apellido) attributes.APELLIDOS = String(lead.data.Apellido);
+        const phone = normalizePhone(lead?.data?.telefono);
+        if (phone) attributes.TELEFONO = phone;
+        if (phone) attributes.SMS = phone;
+        if (lead?.data?.web) attributes.URL_SITIO = String(lead.data.web);
         if (lead?.data?.selecciona_un_servicio)
-          attributes.SERVICIO = String(lead.data.selecciona_un_servicio);
+          attributes.SERVICIOS = String(lead.data.selecciona_un_servicio);
         if (lead?.data?.["¿cúentanos_en_qué_necesitas_ayuda?"])
           attributes.MENSAJE = String(lead.data["¿cúentanos_en_qué_necesitas_ayuda?"]);
 
@@ -970,10 +1620,16 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
         continue;
       }
 
+      const message = String(firstAttempt.data?.message || firstAttempt.data?.error?.message || "").toLowerCase();
+      const invalidPhone = message.includes("invalid phone number");
+      const withoutPhone = { ...c.attributes };
+      delete withoutPhone.TELEFONO;
+      delete withoutPhone.SMS;
+
       const fallbackAttempt = await brevoUpsertContact({
         apiKey: brevoKey,
         email: c.email,
-        attributes: {},
+        attributes: invalidPhone ? withoutPhone : {},
         listId: validListId ? listIdNumber : null
       });
 
