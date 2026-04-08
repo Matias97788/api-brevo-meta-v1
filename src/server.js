@@ -777,6 +777,27 @@ function isValidEmail(value) {
   return re.test(s);
 }
 
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const list = Array.isArray(items) ? items : [];
+  const limit =
+    Number.isInteger(concurrency) && concurrency > 0 ? Math.min(concurrency, 15) : 5;
+
+  const results = new Array(list.length);
+  let next = 0;
+
+  const workers = Array.from({ length: Math.min(limit, list.length) }, async () => {
+    while (true) {
+      const i = next;
+      next += 1;
+      if (i >= list.length) return;
+      results[i] = await mapper(list[i], i);
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
+
 function repairBrevoAttributes({ email, attributes }) {
   const patch = {};
   const lowerEmail = String(email || "").trim().toLowerCase();
@@ -1541,6 +1562,13 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
       ? Number.parseInt(req.query.limit.trim(), 10)
       : null;
 
+  const maxContactsRaw = typeof req.query.max_contacts === "string" ? req.query.max_contacts.trim() : "";
+  const maxContacts = maxContactsRaw ? Number.parseInt(maxContactsRaw, 10) : null;
+
+  const concurrencyRaw = typeof req.query.concurrency === "string" ? req.query.concurrency.trim() : "";
+  const concurrencyParsed = concurrencyRaw ? Number.parseInt(concurrencyRaw, 10) : null;
+  const concurrency = Number.isInteger(concurrencyParsed) && concurrencyParsed > 0 ? concurrencyParsed : 5;
+
   const listId =
     typeof req.query.list_id === "string" && req.query.list_id.trim()
       ? req.query.list_id.trim()
@@ -1624,36 +1652,59 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
       })
       .filter(Boolean);
 
+    const invalidEmailResults = candidates
+      .filter((c) => !isValidEmail(c.email))
+      .slice(0, 50)
+      .map((c) => ({
+        email: c.email,
+        status: 400,
+        error: { code: "invalid_email", message: "Invalid email address" }
+      }));
+
+    const validCandidates = candidates
+      .filter((c) => isValidEmail(c.email))
+      .reduce((acc, c) => {
+        const emailLower = String(c.email).trim().toLowerCase();
+        if (!emailLower) return acc;
+        if (acc.some((x) => x.emailLower === emailLower)) return acc;
+        acc.push({ ...c, emailLower });
+        return acc;
+      }, []);
+
+    const selectedCandidates =
+      Number.isInteger(maxContacts) && maxContacts > 0
+        ? validCandidates.slice(0, Math.min(maxContacts, validCandidates.length))
+        : validCandidates;
+
     if (dryRun) {
       return res.json({
         ok: true,
         dry_run: true,
         total_leads: normalizedLeads.length,
-        total_contacts: candidates.length,
-        sample: candidates.slice(0, 5).map((c) => ({
-          email: c.email,
+        total_contacts: selectedCandidates.length,
+        invalid_emails: invalidEmailResults.slice(0, 5).map((x) => x.email),
+        sample: selectedCandidates.slice(0, 5).map((c) => ({
+          email: c.emailLower,
           attributes: c.attributes
         })),
         page: page ? { id: page.id, name: page.name } : null
       });
     }
 
-    const results = [];
-    for (const c of candidates) {
+    const upsertResults = await mapWithConcurrency(selectedCandidates, concurrency, async (c) => {
       const firstAttempt = await brevoUpsertContact({
         apiKey: brevoKey,
-        email: c.email,
+        email: c.emailLower,
         attributes: c.attributes,
         listId: validListId ? listIdNumber : null
       });
 
       if (firstAttempt.ok) {
-        results.push({
-          email: c.email,
+        return {
+          email: c.emailLower,
           status: firstAttempt.status,
           details: firstAttempt.data
-        });
-        continue;
+        };
       }
 
       const message = String(firstAttempt.data?.message || firstAttempt.data?.error?.message || "").toLowerCase();
@@ -1664,79 +1715,38 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
 
       const fallbackAttempt = await brevoUpsertContact({
         apiKey: brevoKey,
-        email: c.email,
+        email: c.emailLower,
         attributes: invalidPhone ? withoutPhone : {},
         listId: validListId ? listIdNumber : null
       });
 
       if (fallbackAttempt.ok) {
-        results.push({
-          email: c.email,
+        return {
+          email: c.emailLower,
           status: fallbackAttempt.status,
           note: "created_without_attributes",
           details: fallbackAttempt.data
-        });
-        continue;
+        };
       }
 
-      results.push({
-        email: c.email,
+      return {
+        email: c.emailLower,
         status: firstAttempt.status,
         error: firstAttempt.data
-      });
-    }
+      };
+    });
+
+    const results = [...upsertResults, ...invalidEmailResults];
 
     let listAdd = null;
-    if (validListId && candidates.length > 0) {
-      const successEmails = results
-        .filter((r) => typeof r.status === "number" && r.status >= 200 && r.status < 300)
-        .map((r) => String(r.email || "").trim().toLowerCase())
-        .filter(Boolean);
-
-      const unique = Array.from(new Set(successEmails));
-      const validFormat = unique.filter(isValidEmail);
-
-      if (validFormat.length === 0) {
-        listAdd = {
-          ok: true,
-          list_id: listIdNumber,
-          note: "no_valid_emails_for_bulk_add",
-          batches: []
-        };
-      } else {
-        const emails = validFormat;
-      const chunks = [];
-      for (let i = 0; i < emails.length; i += 150) {
-        chunks.push(emails.slice(i, i + 150));
-      }
-
-      const listAddResults = [];
-      for (const chunk of chunks) {
-        const r = await brevoAddContactsToList({
-          apiKey: brevoKey,
-          listId: listIdNumber,
-          emails: chunk
-        });
-        listAddResults.push(r);
-      }
-
-      const ok = listAddResults.every((r) => r.ok);
-      listAdd = {
-        ok,
-        list_id: listIdNumber,
-        batches: listAddResults.map((r) => ({
-          ok: r.ok,
-          status: r.status,
-          details: r.data
-        }))
-      };
-      }
+    if (validListId) {
+      listAdd = { ok: true, list_id: listIdNumber, note: "skipped_bulk_add_listIds_in_upsert" };
     }
 
     return res.json({
       ok: true,
       total_leads: normalizedLeads.length,
-      total_contacts: candidates.length,
+      total_contacts: selectedCandidates.length,
       list_id: validListId ? listIdNumber : null,
       results,
       list_add: listAdd,
