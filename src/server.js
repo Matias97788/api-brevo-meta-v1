@@ -1565,6 +1565,13 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
   const maxContactsRaw = typeof req.query.max_contacts === "string" ? req.query.max_contacts.trim() : "";
   const maxContacts = maxContactsRaw ? Number.parseInt(maxContactsRaw, 10) : null;
 
+  const offsetRaw = typeof req.query.offset === "string" ? req.query.offset.trim() : "";
+  const offsetParsed = offsetRaw ? Number.parseInt(offsetRaw, 10) : null;
+  const offset = Number.isInteger(offsetParsed) && offsetParsed >= 0 ? offsetParsed : 0;
+
+  const orderRaw = typeof req.query.order === "string" ? req.query.order.trim().toLowerCase() : "";
+  const order = orderRaw === "asc" || orderRaw === "desc" ? orderRaw : "desc";
+
   const concurrencyRaw = typeof req.query.concurrency === "string" ? req.query.concurrency.trim() : "";
   const concurrencyParsed = concurrencyRaw ? Number.parseInt(concurrencyRaw, 10) : null;
   const concurrency = Number.isInteger(concurrencyParsed) && concurrencyParsed > 0 ? concurrencyParsed : 5;
@@ -1667,14 +1674,30 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
         const emailLower = String(c.email).trim().toLowerCase();
         if (!emailLower) return acc;
         if (acc.some((x) => x.emailLower === emailLower)) return acc;
-        acc.push({ ...c, emailLower });
+        acc.push({ ...c, emailLower, created_time: c?.lead?.created_time || null });
         return acc;
       }, []);
 
+    const timeValue = (t) => {
+      const d = new Date(String(t || ""));
+      const ms = d.getTime();
+      return Number.isFinite(ms) ? ms : 0;
+    };
+
+    validCandidates.sort((a, b) => {
+      const diff =
+        order === "asc"
+          ? timeValue(a.created_time) - timeValue(b.created_time)
+          : timeValue(b.created_time) - timeValue(a.created_time);
+      if (diff !== 0) return diff;
+      return String(a.emailLower).localeCompare(String(b.emailLower));
+    });
+
+    const slicedCandidates = validCandidates.slice(offset);
     const selectedCandidates =
       Number.isInteger(maxContacts) && maxContacts > 0
-        ? validCandidates.slice(0, Math.min(maxContacts, validCandidates.length))
-        : validCandidates;
+        ? slicedCandidates.slice(0, Math.min(maxContacts, slicedCandidates.length))
+        : slicedCandidates;
 
     if (dryRun) {
       return res.json({
@@ -1682,6 +1705,12 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
         dry_run: true,
         total_leads: normalizedLeads.length,
         total_contacts: selectedCandidates.length,
+        pagination: {
+          order,
+          offset,
+          max_contacts: Number.isInteger(maxContacts) && maxContacts > 0 ? maxContacts : null,
+          total_valid_candidates: validCandidates.length
+        },
         invalid_emails: invalidEmailResults.slice(0, 5).map((x) => x.email),
         sample: selectedCandidates.slice(0, 5).map((c) => ({
           email: c.emailLower,
@@ -1747,6 +1776,13 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
       ok: true,
       total_leads: normalizedLeads.length,
       total_contacts: selectedCandidates.length,
+      pagination: {
+        order,
+        offset,
+        max_contacts: Number.isInteger(maxContacts) && maxContacts > 0 ? maxContacts : null,
+        total_valid_candidates: validCandidates.length,
+        invalid_emails_total: candidates.length - validCandidates.length
+      },
       list_id: validListId ? listIdNumber : null,
       results,
       list_add: listAdd,
