@@ -770,6 +770,13 @@ function normalizePhone(value) {
   return null;
 }
 
+function isValidEmail(value) {
+  const s = String(value || "").trim();
+  if (!s) return false;
+  const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return re.test(s);
+}
+
 function repairBrevoAttributes({ email, attributes }) {
   const patch = {};
   const lowerEmail = String(email || "").trim().toLowerCase();
@@ -1681,7 +1688,23 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
 
     let listAdd = null;
     if (validListId && candidates.length > 0) {
-      const emails = candidates.map((c) => c.email);
+      const successEmails = results
+        .filter((r) => typeof r.status === "number" && r.status >= 200 && r.status < 300)
+        .map((r) => String(r.email || "").trim().toLowerCase())
+        .filter(Boolean);
+
+      const unique = Array.from(new Set(successEmails));
+      const validFormat = unique.filter(isValidEmail);
+
+      if (validFormat.length === 0) {
+        listAdd = {
+          ok: true,
+          list_id: listIdNumber,
+          note: "no_valid_emails_for_bulk_add",
+          batches: []
+        };
+      } else {
+        const emails = validFormat;
       const chunks = [];
       for (let i = 0; i < emails.length; i += 150) {
         chunks.push(emails.slice(i, i + 150));
@@ -1707,6 +1730,7 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
           details: r.data
         }))
       };
+      }
     }
 
     return res.json({
