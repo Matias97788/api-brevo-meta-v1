@@ -472,18 +472,24 @@ app.post("/brevo/contacts/upsert", async (req, res) => {
     if (!attributes.TELEFONO) attributes.TELEFONO = rawPhone;
     if (!attributes.SMS) attributes.SMS = rawPhone;
     if (!attributes.LANDLINE_NUMBER) attributes.LANDLINE_NUMBER = rawPhone;
+    if (!attributes.WHATSAPP) attributes.WHATSAPP = rawPhone;
     delete attributes.phone;
   }
   const normalized =
-    normalizePhone(attributes.TELEFONO) || normalizePhone(attributes.SMS) || normalizePhone(attributes.LANDLINE_NUMBER);
+    normalizePhone(attributes.TELEFONO) ||
+    normalizePhone(attributes.SMS) ||
+    normalizePhone(attributes.LANDLINE_NUMBER) ||
+    normalizePhone(attributes.WHATSAPP);
   if (normalized) {
     attributes.TELEFONO = normalized;
     attributes.SMS = normalized;
     attributes.LANDLINE_NUMBER = normalized;
+    attributes.WHATSAPP = normalized;
   } else {
     if (attributes.TELEFONO && !normalizePhone(attributes.TELEFONO)) delete attributes.TELEFONO;
     if (attributes.SMS && !normalizePhone(attributes.SMS)) delete attributes.SMS;
     if (attributes.LANDLINE_NUMBER && !normalizePhone(attributes.LANDLINE_NUMBER)) delete attributes.LANDLINE_NUMBER;
+    if (attributes.WHATSAPP && !normalizePhone(attributes.WHATSAPP)) delete attributes.WHATSAPP;
   }
   const r = await brevoUpsertContact({
     apiKey: brevoKey,
@@ -779,6 +785,7 @@ function applyPhoneAttributes(attributes, phone) {
   attributes.TELEFONO = p;
   attributes.SMS = p;
   attributes.LANDLINE_NUMBER = p;
+  attributes.WHATSAPP = p;
 }
 
 function isValidEmail(value) {
@@ -864,6 +871,8 @@ function repairBrevoAttributes({ email, attributes }) {
     if (!sms || normalizePhone(sms) !== p) patch.SMS = p;
     const landline = get("LANDLINE_NUMBER");
     if (!landline || normalizePhone(landline) !== p) patch.LANDLINE_NUMBER = p;
+    const whatsapp = get("WHATSAPP");
+    if (!whatsapp || normalizePhone(whatsapp) !== p) patch.WHATSAPP = p;
     patch[sourceKey] = "";
     return true;
   };
@@ -904,7 +913,17 @@ function repairBrevoAttributes({ email, attributes }) {
     }
   }
 
-  const primaryPhone = normalizePhone(get("TELEFONO") || get("SMS") || get("LANDLINE_NUMBER"));
+  const whatsapp = get("WHATSAPP");
+  if (whatsapp) {
+    const p = normalizePhone(whatsapp);
+    if (p) {
+      if (whatsapp !== p) patch.WHATSAPP = p;
+    } else {
+      patch.WHATSAPP = null;
+    }
+  }
+
+  const primaryPhone = normalizePhone(get("TELEFONO") || get("SMS") || get("LANDLINE_NUMBER") || get("WHATSAPP"));
   if (primaryPhone) {
     const currentLandline = get("LANDLINE_NUMBER");
     if (!currentLandline || normalizePhone(currentLandline) !== primaryPhone) patch.LANDLINE_NUMBER = primaryPhone;
@@ -912,6 +931,8 @@ function repairBrevoAttributes({ email, attributes }) {
     if (!currentTelefono || normalizePhone(currentTelefono) !== primaryPhone) patch.TELEFONO = primaryPhone;
     const currentSms = get("SMS");
     if (!currentSms || normalizePhone(currentSms) !== primaryPhone) patch.SMS = primaryPhone;
+    const currentWhatsapp = get("WHATSAPP");
+    if (!currentWhatsapp || normalizePhone(currentWhatsapp) !== primaryPhone) patch.WHATSAPP = primaryPhone;
   }
 
   const servicios = get("SERVICIOS");
@@ -1773,6 +1794,7 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
       delete withoutPhone.TELEFONO;
       delete withoutPhone.SMS;
       delete withoutPhone.LANDLINE_NUMBER;
+      delete withoutPhone.WHATSAPP;
 
       const fallbackAttempt = await brevoUpsertContact({
         apiKey: brevoKey,

@@ -138,6 +138,7 @@ test("brevo sync envía TELEFONO y LANDLINE_NUMBER con el mismo valor para ambos
       assert.deepEqual(call.body?.listIds, [22]);
       assert.equal(call.body?.attributes?.TELEFONO, expectedPhone);
       assert.equal(call.body?.attributes?.LANDLINE_NUMBER, expectedPhone);
+      assert.equal(call.body?.attributes?.WHATSAPP, expectedPhone);
       assert.equal(call.body?.attributes?.SMS, expectedPhone);
     }
   } finally {
