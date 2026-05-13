@@ -135,9 +135,7 @@ app.post("/webhook/meta", async (req, res) => {
           const attributes = {};
           if (data?.Nombre) attributes.NOMBRE = String(data.Nombre);
           if (data?.Apellido) attributes.APELLIDOS = String(data.Apellido);
-          const phone = normalizePhone(data?.telefono);
-          if (phone) attributes.TELEFONO = phone;
-          if (phone) attributes.SMS = phone;
+          applyPhoneAttributes(attributes, data?.telefono);
           if (data?.web) attributes.URL_SITIO = String(data.web);
           if (data?.selecciona_un_servicio) attributes.SERVICIOS = String(data.selecciona_un_servicio);
           if (data?.["¿cúentanos_en_qué_necesitas_ayuda?"])
@@ -469,19 +467,23 @@ app.post("/brevo/contacts/upsert", async (req, res) => {
   const validListId = Number.isInteger(listIdNumber) && listIdNumber > 0;
   const attrs = req.body?.attributes && typeof req.body.attributes === "object" ? req.body.attributes : {};
   const attributes = { ...attrs };
-  if (attributes.phone && !attributes.SMS) {
-    attributes.SMS = String(attributes.phone);
+  if (attributes.phone) {
+    const rawPhone = String(attributes.phone);
+    if (!attributes.TELEFONO) attributes.TELEFONO = rawPhone;
+    if (!attributes.SMS) attributes.SMS = rawPhone;
+    if (!attributes.LANDLINE_NUMBER) attributes.LANDLINE_NUMBER = rawPhone;
     delete attributes.phone;
   }
-  if (attributes.TELEFONO) {
-    const p = normalizePhone(attributes.TELEFONO);
-    if (p) attributes.TELEFONO = p;
-    else delete attributes.TELEFONO;
-  }
-  if (attributes.SMS) {
-    const p = normalizePhone(attributes.SMS);
-    if (p) attributes.SMS = p;
-    else delete attributes.SMS;
+  const normalized =
+    normalizePhone(attributes.TELEFONO) || normalizePhone(attributes.SMS) || normalizePhone(attributes.LANDLINE_NUMBER);
+  if (normalized) {
+    attributes.TELEFONO = normalized;
+    attributes.SMS = normalized;
+    attributes.LANDLINE_NUMBER = normalized;
+  } else {
+    if (attributes.TELEFONO && !normalizePhone(attributes.TELEFONO)) delete attributes.TELEFONO;
+    if (attributes.SMS && !normalizePhone(attributes.SMS)) delete attributes.SMS;
+    if (attributes.LANDLINE_NUMBER && !normalizePhone(attributes.LANDLINE_NUMBER)) delete attributes.LANDLINE_NUMBER;
   }
   const r = await brevoUpsertContact({
     apiKey: brevoKey,
@@ -770,6 +772,15 @@ function normalizePhone(value) {
   return null;
 }
 
+function applyPhoneAttributes(attributes, phone) {
+  if (!attributes || typeof attributes !== "object") return;
+  const p = normalizePhone(phone);
+  if (!p) return;
+  attributes.TELEFONO = p;
+  attributes.SMS = p;
+  attributes.LANDLINE_NUMBER = p;
+}
+
 function isValidEmail(value) {
   const s = String(value || "").trim();
   if (!s) return false;
@@ -851,6 +862,8 @@ function repairBrevoAttributes({ email, attributes }) {
     if (!current || normalizePhone(current) !== p) patch.TELEFONO = p;
     const sms = get("SMS");
     if (!sms || normalizePhone(sms) !== p) patch.SMS = p;
+    const landline = get("LANDLINE_NUMBER");
+    if (!landline || normalizePhone(landline) !== p) patch.LANDLINE_NUMBER = p;
     patch[sourceKey] = "";
     return true;
   };
@@ -879,6 +892,26 @@ function repairBrevoAttributes({ email, attributes }) {
     } else {
       patch.SMS = null;
     }
+  }
+
+  const landline = get("LANDLINE_NUMBER");
+  if (landline) {
+    const p = normalizePhone(landline);
+    if (p) {
+      if (landline !== p) patch.LANDLINE_NUMBER = p;
+    } else {
+      patch.LANDLINE_NUMBER = null;
+    }
+  }
+
+  const primaryPhone = normalizePhone(get("TELEFONO") || get("SMS") || get("LANDLINE_NUMBER"));
+  if (primaryPhone) {
+    const currentLandline = get("LANDLINE_NUMBER");
+    if (!currentLandline || normalizePhone(currentLandline) !== primaryPhone) patch.LANDLINE_NUMBER = primaryPhone;
+    const currentTelefono = get("TELEFONO");
+    if (!currentTelefono || normalizePhone(currentTelefono) !== primaryPhone) patch.TELEFONO = primaryPhone;
+    const currentSms = get("SMS");
+    if (!currentSms || normalizePhone(currentSms) !== primaryPhone) patch.SMS = primaryPhone;
   }
 
   const servicios = get("SERVICIOS");
@@ -1646,9 +1679,7 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
         const attributes = {};
         if (lead?.data?.Nombre) attributes.NOMBRE = String(lead.data.Nombre);
         if (lead?.data?.Apellido) attributes.APELLIDOS = String(lead.data.Apellido);
-        const phone = normalizePhone(lead?.data?.telefono);
-        if (phone) attributes.TELEFONO = phone;
-        if (phone) attributes.SMS = phone;
+        applyPhoneAttributes(attributes, lead?.data?.telefono);
         if (lead?.data?.web) attributes.URL_SITIO = String(lead.data.web);
         if (lead?.data?.selecciona_un_servicio)
           attributes.SERVICIOS = String(lead.data.selecciona_un_servicio);
@@ -1741,6 +1772,7 @@ app.get("/brevo/sync/forms/:form_id/leads", async (req, res) => {
       const withoutPhone = { ...c.attributes };
       delete withoutPhone.TELEFONO;
       delete withoutPhone.SMS;
+      delete withoutPhone.LANDLINE_NUMBER;
 
       const fallbackAttempt = await brevoUpsertContact({
         apiKey: brevoKey,
@@ -1808,4 +1840,4 @@ if (require.main === module) {
 }
 
 // Exporta app para tests o para montarla desde otro entrypoint
-module.exports = { app };
+module.exports = { app, normalizePhone, applyPhoneAttributes };
